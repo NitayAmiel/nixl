@@ -87,6 +87,17 @@ fi
 python3 test/python/prep_xfer_perf.py list
 python3 test/python/prep_xfer_perf.py array
 
+if $HAS_GPU ; then
+    echo "==== Running elastic EP test ===="
+    NIXL_BUILD_DIR=${NIXL_BUILD_DIR:-nixl_build}
+    EP_SRC_DIR="examples/device/ep"
+    export PYTHONPATH="${NIXL_BUILD_DIR}/${EP_SRC_DIR}:${EP_SRC_DIR}${PYTHONPATH:+:$PYTHONPATH}"
+    python3 ${EP_SRC_DIR}/tests/elastic/elastic.py \
+        --plan ${EP_SRC_DIR}/tests/elastic/expansion_fault_contraction.json \
+        --num-processes 4 \
+        --assert-perf
+fi
+
 echo "==== Running python examples ===="
 cd examples/python
 python3 partial_md_example.py --init-port "$(get_next_tcp_port)" --target-port "$(get_next_tcp_port)"

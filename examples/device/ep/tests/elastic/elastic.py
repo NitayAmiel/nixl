@@ -67,7 +67,7 @@ def handle_sigterm(
     if buffer is not None and buffer.runtime is not None:
         buffer.destroy()  # to invalidate local MD
         del buffer
-    sys.exit(1)
+    sys.exit(0)
 
 
 def self_kill():
@@ -91,6 +91,7 @@ def test_main(
     torch.manual_seed(seed + rank)
     torch.cuda.manual_seed(seed + rank)
     random.seed(seed + rank)
+    num_topk = min(num_topk, num_experts)
 
     assert num_experts % num_ranks == 0
     num_local_experts = num_experts // num_ranks
@@ -409,15 +410,16 @@ def test_main(
 
     # Dispatch + combine testing
     avg_t, min_t, max_t = bench(partial(test_func, return_recv_hook=False))
+    bandwidth_gbps = (num_dispatch_comm_bytes + num_combine_comm_bytes) / 1e9 / avg_t
     print(
-        f"[rank {rank}] Dispatch + combine bandwidth: {(num_dispatch_comm_bytes + num_combine_comm_bytes) / 1e9 / avg_t:.2f} GB/s, "
+        f"[rank {rank}] Dispatch + combine bandwidth: {bandwidth_gbps:.2f} GB/s, "
         f"avg_t={avg_t * 1e6:.2f} us, min_t={min_t * 1e6:.2f} us, max_t={max_t * 1e6:.2f} us",
         flush=True,
     )
 
     # Separate profiling
     if not kineto:
-        return
+        return bandwidth_gbps, avg_t, min_t, max_t
 
     for return_recv_hook in (False, True):
         buffer.barrier()
@@ -441,6 +443,8 @@ def test_main(
                 f"Combine send/recv time: {combine_t[0] * 1e6:.2f} + {combine_t[1] * 1e6:.2f} us",
                 flush=True,
             )
+
+    return bandwidth_gbps, avg_t, min_t, max_t
 
 
 def worker(torch_rank: int, args: argparse.Namespace):
@@ -550,7 +554,7 @@ def worker(torch_rank: int, args: argparse.Namespace):
         current_num_ranks = max(active_ranks_list) + 1  # Sparse indexing
         current_num_experts = args.num_experts_per_rank * current_num_ranks
 
-        test_main(
+        bandwidth_gbps, avg_t, min_t, max_t = test_main(
             args.num_tokens,
             args.hidden_dim,
             current_num_experts,
@@ -562,6 +566,33 @@ def worker(torch_rank: int, args: argparse.Namespace):
             kineto=args.kineto,
             fault_tolerance_test=kill_rank,
         )
+
+        if not kill_rank and args.assert_perf:
+            perf_failures = []
+            if bandwidth_gbps < args.min_bandwidth_gbps:
+                perf_failures.append(
+                    f"bandwidth {bandwidth_gbps:.2f} GB/s below minimum {args.min_bandwidth_gbps} GB/s"
+                )
+            max_avg_latency_s = args.max_avg_latency_us * 1e-6
+            if avg_t > max_avg_latency_s:
+                perf_failures.append(
+                    f"avg latency {avg_t * 1e6:.2f} us exceeds maximum {args.max_avg_latency_us} us"
+                )
+            jitter = max_t / min_t if min_t > 0 else float("inf")
+            if jitter > args.max_jitter_ratio:
+                perf_failures.append(
+                    f"jitter ratio {jitter:.2f}x exceeds maximum {args.max_jitter_ratio}x "
+                    f"(min={min_t * 1e6:.2f} us, max={max_t * 1e6:.2f} us)"
+                )
+            if perf_failures:
+                for msg in perf_failures:
+                    print(
+                        f"PERF FAIL [rank {global_rank}] phase {plan.get_phase()}: {msg}",
+                        flush=True,
+                    )
+                buffer.destroy()
+                sys.exit(1)
+
         # Query mask buffer to detect any unexpected rank failures and clean them up
         buffer.query_mask_buffer(mask_status)
         newly_failed_ranks = set()
@@ -624,6 +655,29 @@ def main():
         action="store_true",
         help="Disable NVLink communication for low-latency kernels",
     )
+    parser.add_argument(
+        "--assert-perf",
+        action="store_true",
+        help="Enable performance assertions (bandwidth, latency, jitter)",
+    )
+    parser.add_argument(
+        "--min-bandwidth-gbps",
+        type=float,
+        default=5.0,
+        help="Minimum dispatch+combine bandwidth in GB/s (0 to disable check)",
+    )
+    parser.add_argument(
+        "--max-avg-latency-us",
+        type=float,
+        default=2000.0,
+        help="Maximum average dispatch+combine latency in microseconds",
+    )
+    parser.add_argument(
+        "--max-jitter-ratio",
+        type=float,
+        default=5.0,
+        help="Maximum allowed max_t/min_t ratio",
+    )
 
     args = parser.parse_args()
 
@@ -646,11 +700,28 @@ def main():
         start_method="spawn",
     )
 
+    failed = False
+    while True:
+        all_done = True
+        for p in ctx.processes:
+            if p.is_alive():
+                all_done = False
+            elif p.exitcode is not None and p.exitcode != 0:
+                failed = True
+        if failed or all_done:
+            break
+        time.sleep(0.1)
+
+    if failed:
+        for p in ctx.processes:
+            if p.is_alive():
+                p.kill()
+        for p in ctx.processes:
+            p.join(timeout=5)
+        sys.exit(1)
+
     for p in ctx.processes:
-        try:
-            p.join()
-        except Exception:
-            pass
+        p.join()
 
 
 if __name__ == "__main__":
