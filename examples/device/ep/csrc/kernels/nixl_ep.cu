@@ -278,9 +278,10 @@ DISPATCH_RECV:
         return;
 
     // For send-and-recv kernels, we need a grid sync for making `packed_recv_count` visible
-    if (phases & EP_SEND_PHASE)
+    if (phases & EP_SEND_PHASE) {
+        __syncthreads();
         cg::this_grid().sync();
-
+    }
     // Receiving and packing
     if (responsible_expert_idx < num_experts) {
         const auto src_rank = responsible_expert_idx / num_local_experts;

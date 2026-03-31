@@ -128,6 +128,9 @@ if get_option('buildtype') == 'debug'
     nixl_ep_override_options = ['optimization=3']
     nixl_ep_cpp_args += ['-g']
 endif
+if get_option('nvcc_device_debug')
+    nixl_ep_cuda_args += ['-G']
+endif
 
 enable_fast_debug = get_option('buildtype') != 'release'
 

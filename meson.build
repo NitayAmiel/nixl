@@ -168,6 +168,10 @@ if cuda_dep.found()
     add_project_arguments('-forward-unknown-to-host-compiler', language: 'cuda')
     add_project_arguments('-rdc=true', language: 'cuda')
 
+    if get_option('nvcc_device_debug')
+        add_project_arguments('-G', language: 'cuda')
+    endif
+
     nvcc_flags_link = []
     # nixl ep cannot be built with sm_80
     if not get_option('build_nixl_ep')
